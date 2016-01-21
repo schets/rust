@@ -44,7 +44,7 @@ use alloc::boxed::Box;
 use core::ptr;
 use core::cell::UnsafeCell;
 
-use sync::atomic::{AtomicPtr, Ordering};
+use sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 /// A result of the `pop` function.
 pub enum PopResult<T> {
@@ -62,6 +62,67 @@ pub enum PopResult<T> {
 struct Node<T> {
     next: AtomicPtr<Node<T>>,
     value: Option<T>,
+}
+
+// A linked spmc or stack for the cache seems better,
+// but both of those suffer from the aba problem.
+// This has very comparable performance - practically identical
+// This allows a bounded cache without maintaining a count,
+// which means inserts iinvolve 0 atomics, meaning queue pops
+// involve 0 atomics.
+
+struct CacheNode<T> {
+    elem: *mut T,
+    seq: isize,
+}
+
+/// A SpMc cache for mpsc nodes
+struct CacheBufferSpMc<T> {
+    buffer_head: AtomicUsize,
+    buffer_tail: AtomicUsize,
+    cache_buffer: Vec<mut CacheNode<T>>,
+    // FIXME:
+    // If a cache barrier were present,
+    // a tail local head cache would be useful
+    // Once a good way for that is in the stdlib
+    // it should be added here
+}
+
+impl<T> for CacheBufferSpMc<T> {
+    pub fn new (buffer: usize) {
+        cache_buffer: vec[ptr::null_mut(); buffer+1];
+        buffer_head: AtomicUsize::new(0),
+        buffer_tail: AtomicUsize::new(0),
+    }
+
+    pub fn add_or_delete(&self, ptr: *mut T) {
+        let cur_tail = self.buffer_tail.load(Ordering::Relaxed);
+        let cur_head = self.buffer_head.load(Ordering::Acquire);
+        next_tail = cur_tail + 1;
+        next_tail = if next_tail == self.cache_buffer.len() {0} else {next_tail};
+        if next_tail == cur_head {
+            unsafe {
+                let _ = Box::from_raw(ptr);
+            }
+            return;
+        }
+
+        self.cache_buffer[next_tail].elem = ptr;
+        self.buffer_tail.store(next_tail, Ordering::Release);
+    }
+
+    pub fn try_retrieve(&self) -> Option<*mut T> {
+        let cur_head = self.buffer_head.load(Ordering::Relaxed);
+        let cur_tail = self.buffer_tail.load(Ordering::Acquire);
+        if cur_head == cur_tail {return None}
+        loop {
+            let rval = self.cache_buffer[cur_head];
+            let old_head = self.buffer_head.compare_exchange(cur_head,
+                                                             cur_head + 1,
+                                                             Ordering::Release);
+            if old_head == cur_head
+        }
+    }
 }
 
 /// The multi-producer single-consumer structure. This is not cloneable, but it
@@ -87,7 +148,7 @@ impl<T> Node<T> {
 impl<T> Queue<T> {
     /// Creates a new queue that is safe to share among multiple producers and
     /// one consumer.
-    pub fn new() -> Queue<T> {
+    pub fn new(buffer: usize) -> Queue<T> {
         let stub = unsafe { Node::new(None) };
         Queue {
             head: AtomicPtr::new(stub),
@@ -130,6 +191,9 @@ impl<T> Queue<T> {
 
             if self.head.load(Ordering::Acquire) == tail {Empty} else {Inconsistent}
         }
+    }
+
+    fn add_to_cache(&self, ptr: *mut Node<T>) {
     }
 }
 
