@@ -45,7 +45,7 @@ use core::ptr;
 use vec::Vec;
 use core::cell::UnsafeCell;
 
-use sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use sync::atomic::{AtomicPtr, AtomicUsize, AtomicBool, Ordering};
 
 /// A result of the `pop` function.
 pub enum PopResult<T> {
@@ -76,7 +76,8 @@ struct Node<T> {
 struct CacheBufferSpMc<T> {
     buffer_head: AtomicUsize,
     buffer_tail: AtomicUsize,
-    cache_buffer: Vec<UnsafeCell<(*mut T, bool)>>,
+    buffer_mask: usize,
+    cache_buffer: Vec<UnsafeCell<(*mut T, AtomicBool)>>,
     // FIXME:
     // If a cache barrier were present,
     // a tail local head cache would be useful
@@ -84,46 +85,78 @@ struct CacheBufferSpMc<T> {
     // it should be added here
 }
 
+
 impl<T> CacheBufferSpMc<T> {
     pub fn new (buffer: usize) -> CacheBufferSpMc<T> {
+        debug_assert!(buffer > 0);
+        debug_assert!(buffer % 2 == 0);
+        let mut buff_vec = Vec::with_capacity(buffer + 1);
+        for _ in 0..(buffer + 1) {
+            buff_vec.push(UnsafeCell::new((ptr::null_mut(),
+                                           AtomicBool::new(false))));
+        }
         CacheBufferSpMc {
-            cache_buffer: vec![UnsafeCell::new((ptr::null_mut(), false)); buffer],
-            buffer_head: AtomicUsize::new(0),
-            buffer_tail: AtomicUsize::new(0),
+            cache_buffer: buff_vec,
+            buffer_mask: buffer - 1,
+            buffer_head: AtomicUsize::new(1),
+            buffer_tail: AtomicUsize::new(1),
         }
     }
 
     pub fn add_or_delete(&self, ptr: *mut T) {
         let cur_tail = self.buffer_tail.load(Ordering::Relaxed);
-        let cur_head = self.buffer_head.load(Ordering::Acquire);
-        let next_tail = cur_tail + 1;
-        next_tail = if next_tail == self.cache_buffer.len() {0} else {next_tail};
-        if next_tail == cur_head {
-            unsafe {
-                let _ = Box::from_raw(ptr);
-            }
-            return;
-        }
+        let next_tail = (cur_tail.wrapping_add(1)) & self.buffer_mask;
+
+        // We don't need to check head, since the valid flag acts as a
+        // barrier to the least-progressed consumer. In fact, head doesn't mean
+        // anything - head can by far ahead, while
 
         unsafe {
-            self.cache_buffer[next_tail].get().0 = ptr;
+            let curnode = self.cache_buffer[next_tail].get();
+            if (*curnode).1.load(Ordering::Acquire) {
+                    let _ = Box::from_raw(ptr);
+                return;
+            }
+
+            (*curnode).0 = ptr;
+            (*curnode).1.store(true, Ordering::Release);
+
         }
         self.buffer_tail.store(next_tail, Ordering::Release);
     }
 
+    // this one's only valid under 64 bit, may only be
+    // faster on x86_64
     pub fn try_retrieve(&self) -> Option<*mut T> {
-        let cur_head = self.buffer_head.load(Ordering::Relaxed);
-        let cur_tail = self.buffer_tail.load(Ordering::Acquire);
-        if cur_head == cur_tail {return None}
-        loop {
-            let rval = self.cache_buffer[cur_head];
-            let old_head = self.buffer_head.compare_and_swap(cur_head,
-                                                             cur_head + 1,
-                                                             Ordering::Release);
-            if old_head == cur_head {
-            }
+        let cur_head_guess = self.buffer_head.load(Ordering::Relaxed);
+        let ctail = self.buffer_tail.load(Ordering::Acquire);
+
+        // Tail matters here to prevent consumer wraparound - so that heads
+        // can't wrap past tail and view a valid spot in conjunction with a
+        // previous consumer. Tail can't wrap around since it can't bypass
+        // a currently valid node, which in turn with this prevent
+
+        if cur_head_guess >= ctail {
+            return None
         }
-        None
+
+        let cur_head_attempt = self.buffer_head.fetch_add(1, Ordering::Relaxed);
+        let cur_head_mask = cur_head_attempt & self.buffer_mask;
+        if cur_head_attempt >= ctail {
+            self.buffer_head.fetch_sub(1, Ordering::Relaxed);
+            return None
+        }
+
+        unsafe {
+            let curnode = self.cache_buffer[cur_head_mask].get();
+            if !(*curnode).1.load(Ordering::Acquire) {
+                self.buffer_head.fetch_sub(1, Ordering::Relaxed);
+                return None
+            }
+            let rval = Some((*curnode).0);
+            (*curnode).1.store(true, Ordering::Release);
+            rval
+        }
     }
 }
 
@@ -133,6 +166,7 @@ impl<T> CacheBufferSpMc<T> {
 pub struct Queue<T> {
     head: AtomicPtr<Node<T>>,
     tail: UnsafeCell<*mut Node<T>>,
+    cache: CacheBufferSpMc<Node<T>>,
 }
 
 unsafe impl<T: Send> Send for Queue<T> { }
@@ -155,13 +189,17 @@ impl<T> Queue<T> {
         Queue {
             head: AtomicPtr::new(stub),
             tail: UnsafeCell::new(stub),
+            cache: CacheBufferSpMc::new(buffer),
         }
     }
 
     /// Pushes a new value onto this queue.
     pub fn push(&self, t: T) {
         unsafe {
-            let n = Node::new(Some(t));
+            let n = match self.cache.try_retrieve() {
+                Some(ptr) => ptr,
+                None => Node::new(Some(t)),
+            };
             let prev = self.head.swap(n, Ordering::AcqRel);
             (*prev).next.store(n, Ordering::Release);
         }
@@ -187,15 +225,12 @@ impl<T> Queue<T> {
                 assert!((*tail).value.is_none());
                 assert!((*next).value.is_some());
                 let ret = (*next).value.take().unwrap();
-                let _: Box<Node<T>> = Box::from_raw(tail);
+                self.cache.add_or_delete(next);
                 return Data(ret);
             }
 
             if self.head.load(Ordering::Acquire) == tail {Empty} else {Inconsistent}
         }
-    }
-
-    fn add_to_cache(&self, ptr: *mut Node<T>) {
     }
 }
 
@@ -223,7 +258,7 @@ mod tests {
 
     #[test]
     fn test_full() {
-        let q: Queue<Box<_>> = Queue::new();
+        let q: Queue<Box<_>> = Queue::new(128);
         q.push(box 1);
         q.push(box 2);
     }
@@ -232,7 +267,7 @@ mod tests {
     fn test() {
         let nthreads = 8;
         let nmsgs = 1000;
-        let q = Queue::new();
+        let q = Queue::new(128);
         match q.pop() {
             Empty => {}
             Inconsistent | Data(..) => panic!()
