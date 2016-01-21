@@ -77,7 +77,7 @@ struct CacheBufferSpMc<T> {
     buffer_head: AtomicUsize,
     buffer_tail: AtomicUsize,
     buffer_mask: usize,
-    cache_buffer: Vec<UnsafeCell<(*mut T, AtomicBool)>>,
+    cache_buffer: Vec<UnsafeCell<*mut T>>,
     // FIXME:
     // If a cache barrier were present,
     // a tail local head cache would be useful
@@ -92,71 +92,70 @@ impl<T> CacheBufferSpMc<T> {
         debug_assert!(buffer % 2 == 0);
         let mut buff_vec = Vec::with_capacity(buffer + 1);
         for _ in 0..(buffer + 1) {
-            buff_vec.push(UnsafeCell::new((ptr::null_mut(),
-                                           AtomicBool::new(false))));
+            buff_vec.push(UnsafeCell::new(ptr::null_mut()));
         }
         CacheBufferSpMc {
             cache_buffer: buff_vec,
             buffer_mask: buffer - 1,
-            buffer_head: AtomicUsize::new(1),
-            buffer_tail: AtomicUsize::new(1),
+            buffer_head: AtomicUsize::new(0),
+            buffer_tail: AtomicUsize::new(0),
         }
     }
 
     pub fn add_or_delete(&self, ptr: *mut T) {
         let cur_tail = self.buffer_tail.load(Ordering::Relaxed);
-        let next_tail = (cur_tail.wrapping_add(1)) & self.buffer_mask;
-
-        // We don't need to check head, since the valid flag acts as a
-        // barrier to the least-progressed consumer. In fact, head doesn't mean
-        // anything - head can by far ahead, while
+        let next_tail = cur_tail.wrapping_add(1);
+        let cur_tail_mask = next_tail & (self.buffer_mask + 1);
+        let cur_head = self.buffer_head.load(Ordering::Acquire);
 
         unsafe {
-            let curnode = self.cache_buffer[next_tail].get();
-            if (*curnode).1.load(Ordering::Acquire) {
-                    let _ = Box::from_raw(ptr);
-                return;
+            if next_tail - cur_head > (self.buffer_mask + 1) {
+                let _ = Box::from_raw(ptr);
+                return
             }
 
-            (*curnode).0 = ptr;
-            (*curnode).1.store(true, Ordering::Release);
+            let curnode = self.cache_buffer[cur_tail_mask].get();
+            *curnode = ptr;
 
         }
         self.buffer_tail.store(next_tail, Ordering::Release);
     }
 
-    // this one's only valid under 64 bit, may only be
-    // faster on x86_64
+    // I've seen variants that optimistically xadds and then backs off
+    // if it fails. This eliminates CAS contention. But my version failed,
+    // and I'm not convinvced the source was even correct
     pub fn try_retrieve(&self) -> Option<*mut T> {
         let cur_head_guess = self.buffer_head.load(Ordering::Relaxed);
-        let ctail = self.buffer_tail.load(Ordering::Acquire);
+        let mut ctail = self.buffer_tail.load(Ordering::Acquire);
 
-        // Tail matters here to prevent consumer wraparound - so that heads
-        // can't wrap past tail and view a valid spot in conjunction with a
-        // previous consumer. Tail can't wrap around since it can't bypass
-        // a currently valid node, which in turn with this prevent
-
-        if cur_head_guess >= ctail {
+        if cur_head_guess == ctail {
             return None
         }
 
-        let cur_head_attempt = self.buffer_head.fetch_add(1, Ordering::Relaxed);
-        let cur_head_mask = cur_head_attempt & self.buffer_mask;
-        if cur_head_attempt >= ctail {
-            self.buffer_head.fetch_sub(1, Ordering::Relaxed);
-            return None
-        }
-
-        unsafe {
-            let curnode = self.cache_buffer[cur_head_mask].get();
-            if !(*curnode).1.load(Ordering::Acquire) {
-                self.buffer_head.fetch_sub(1, Ordering::Relaxed);
-                return None
+        let mut cur_head = self.buffer_head.load(Ordering::Relaxed);
+        for _ in 0..1 {
+            let cur_head_mask = cur_head & self.buffer_mask;
+            if cur_head >= ctail {
+                ctail = self.buffer_tail.load(Ordering::Acquire);
+                if cur_head >= ctail {
+                    return None
+                }
             }
-            let rval = Some((*curnode).0);
-            (*curnode).1.store(true, Ordering::Release);
-            rval
+
+            unsafe {
+                let valptr = self.cache_buffer[cur_head_mask].get();
+                let rval = *valptr;
+                *valptr = ptr::null_mut();
+                let old_head = cur_head;
+                cur_head = self.buffer_head.compare_and_swap(cur_head,
+                   cur_head.wrapping_add(1),
+                   Ordering::Release);
+                if cur_head == old_head {
+                    return Some(rval)
+                }
+            };
         }
+        None
     }
 }
 
@@ -179,6 +178,13 @@ impl<T> Node<T> {
             value: v,
         })
     }
+    unsafe fn from_ptr(v: Option<T>, ptr: *mut Node<T>) -> *mut Node<T> {
+        *ptr = Node {
+            next: AtomicPtr::new(ptr::null_mut()),
+            value: v,
+        };
+        ptr
+    }
 }
 
 impl<T> Queue<T> {
@@ -196,8 +202,9 @@ impl<T> Queue<T> {
     /// Pushes a new value onto this queue.
     pub fn push(&self, t: T) {
         unsafe {
+            //self.cache.try_retrieve().map(|p| Box::from_raw(p));
             let n = match self.cache.try_retrieve() {
-                Some(ptr) => ptr,
+                Some(ptr) => Node::from_ptr(Some(t), ptr),
                 None => Node::new(Some(t)),
             };
             let prev = self.head.swap(n, Ordering::AcqRel);
@@ -225,7 +232,7 @@ impl<T> Queue<T> {
                 assert!((*tail).value.is_none());
                 assert!((*next).value.is_some());
                 let ret = (*next).value.take().unwrap();
-                self.cache.add_or_delete(next);
+                self.cache.add_or_delete(tail);
                 return Data(ret);
             }
 
@@ -242,6 +249,12 @@ impl<T> Drop for Queue<T> {
                 let next = (*cur).next.load(Ordering::Relaxed);
                 let _: Box<Node<T>> = Box::from_raw(cur);
                 cur = next;
+            }
+            loop {
+                match self.cache.try_retrieve() {
+                    Some(ptr) => {let _ = Box::from_raw(ptr);},
+                    None => break,
+                }
             }
         }
     }
