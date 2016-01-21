@@ -42,6 +42,7 @@ pub use self::PopResult::*;
 
 use alloc::boxed::Box;
 use core::ptr;
+use vec::Vec;
 use core::cell::UnsafeCell;
 
 use sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
@@ -71,16 +72,11 @@ struct Node<T> {
 // which means inserts iinvolve 0 atomics, meaning queue pops
 // involve 0 atomics.
 
-struct CacheNode<T> {
-    elem: *mut T,
-    seq: isize,
-}
-
 /// A SpMc cache for mpsc nodes
 struct CacheBufferSpMc<T> {
     buffer_head: AtomicUsize,
     buffer_tail: AtomicUsize,
-    cache_buffer: Vec<mut CacheNode<T>>,
+    cache_buffer: Vec<UnsafeCell<(*mut T, bool)>>,
     // FIXME:
     // If a cache barrier were present,
     // a tail local head cache would be useful
@@ -88,17 +84,19 @@ struct CacheBufferSpMc<T> {
     // it should be added here
 }
 
-impl<T> for CacheBufferSpMc<T> {
-    pub fn new (buffer: usize) {
-        cache_buffer: vec[ptr::null_mut(); buffer+1];
-        buffer_head: AtomicUsize::new(0),
-        buffer_tail: AtomicUsize::new(0),
+impl<T> CacheBufferSpMc<T> {
+    pub fn new (buffer: usize) -> CacheBufferSpMc<T> {
+        CacheBufferSpMc {
+            cache_buffer: vec![UnsafeCell::new((ptr::null_mut(), false)); buffer],
+            buffer_head: AtomicUsize::new(0),
+            buffer_tail: AtomicUsize::new(0),
+        }
     }
 
     pub fn add_or_delete(&self, ptr: *mut T) {
         let cur_tail = self.buffer_tail.load(Ordering::Relaxed);
         let cur_head = self.buffer_head.load(Ordering::Acquire);
-        next_tail = cur_tail + 1;
+        let next_tail = cur_tail + 1;
         next_tail = if next_tail == self.cache_buffer.len() {0} else {next_tail};
         if next_tail == cur_head {
             unsafe {
@@ -107,7 +105,9 @@ impl<T> for CacheBufferSpMc<T> {
             return;
         }
 
-        self.cache_buffer[next_tail].elem = ptr;
+        unsafe {
+            self.cache_buffer[next_tail].get().0 = ptr;
+        }
         self.buffer_tail.store(next_tail, Ordering::Release);
     }
 
@@ -117,11 +117,13 @@ impl<T> for CacheBufferSpMc<T> {
         if cur_head == cur_tail {return None}
         loop {
             let rval = self.cache_buffer[cur_head];
-            let old_head = self.buffer_head.compare_exchange(cur_head,
+            let old_head = self.buffer_head.compare_and_swap(cur_head,
                                                              cur_head + 1,
                                                              Ordering::Release);
-            if old_head == cur_head
+            if old_head == cur_head {
+            }
         }
+        None
     }
 }
 

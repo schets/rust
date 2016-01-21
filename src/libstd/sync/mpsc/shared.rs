@@ -67,7 +67,7 @@ impl<T> Packet<T> {
     // and later by inherit_blocker
     pub fn new() -> Packet<T> {
         let p = Packet {
-            queue: mpsc::Queue::new(),
+            queue: mpsc::Queue::new(128),
             cnt: AtomicIsize::new(0),
             steals: 0,
             to_wake: AtomicUsize::new(0),
