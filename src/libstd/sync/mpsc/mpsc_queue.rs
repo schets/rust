@@ -99,21 +99,17 @@ impl<T> Queue<T> {
     pub fn push(&self, t: T) {
         unsafe {
             let n = Node::new(Some(t));
-            let prev = self.head.swap(n, Ordering::AcqRel);
-            (*prev).next.store(n, Ordering::Release);
+            let mut cur_head = self.head.load(Ordering::Relaxed);
+            loop {
+                (*n).next.store(cur_head, Ordering::Relaxed);
+                let old_head = cur_head;
+                cur_head = self.head.compare_and_swap(cur_head, n, Ordering::Release);
+                if old_head == cur_head {break;}
+            }
         }
     }
 
     /// Pops some data from this queue.
-    ///
-    /// Note that the current implementation means that this function cannot
-    /// return `Option<T>`. It is possible for this queue to be in an
-    /// inconsistent state where many pushes have succeeded and completely
-    /// finished, but pops cannot return `Some(t)`. This inconsistent state
-    /// happens when a pusher is pre-empted at an inopportune moment.
-    ///
-    /// This inconsistent state means that this queue does indeed have data, but
-    /// it does not currently have access to it at this time.
     pub fn pop(&self) -> PopResult<T> {
         unsafe {
             let tail = *self.tail.get();
