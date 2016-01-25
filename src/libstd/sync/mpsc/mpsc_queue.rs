@@ -45,7 +45,7 @@ use core::ptr;
 use vec::Vec;
 use core::cell::UnsafeCell;
 
-use sync::atomic::{AtomicPtr, AtomicUsize, AtomicBool, Ordering};
+use sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 /// A result of the `pop` function.
 pub enum PopResult<T> {
@@ -77,7 +77,7 @@ struct CacheBufferSpMc<T> {
     buffer_head: AtomicUsize,
     buffer_tail: AtomicUsize,
     buffer_mask: usize,
-    cache_buffer: Vec<UnsafeCell<*mut T>>,
+    cache_buffer: Vec<AtomicPtr<T>>,
     // FIXME:
     // If a cache barrier were present,
     // a tail local head cache would be useful
@@ -92,7 +92,7 @@ impl<T> CacheBufferSpMc<T> {
         debug_assert!(buffer % 2 == 0);
         let mut buff_vec = Vec::with_capacity(buffer + 1);
         for _ in 0..(buffer + 1) {
-            buff_vec.push(UnsafeCell::new(ptr::null_mut()));
+            buff_vec.push(AtomicPtr::new(ptr::null_mut()));
         }
         CacheBufferSpMc {
             cache_buffer: buff_vec,
@@ -102,7 +102,11 @@ impl<T> CacheBufferSpMc<T> {
         }
     }
 
+    #[cfg(not(target = "x86_64"))]
     pub fn add_or_delete(&self, ptr: *mut T) {
+        if ptr == ptr::null_mut() {
+            return;
+        }
         let cur_tail = self.buffer_tail.load(Ordering::Relaxed);
         let next_tail = cur_tail.wrapping_add(1);
         let cur_tail_mask = next_tail & (self.buffer_mask + 1);
@@ -121,9 +125,28 @@ impl<T> CacheBufferSpMc<T> {
         self.buffer_tail.store(next_tail, Ordering::Release);
     }
 
-    // I've seen variants that optimistically xadds and then backs off
-    // if it fails. This eliminates CAS contention. But my version failed,
-    // and I'm not convinvced the source was even correct
+    #[cfg(target = "x86_64")]
+    pub fn add_or_delete(&self, ptr: *mut T) {
+        if ptr == ptr::null_mut() {
+            return;
+        }
+        let cur_tail = self.buffer_tail.load(Ordering::Relaxed);
+        let next_tail = cur_tail.wrapping_add(1);
+        let cur_tail_mask = next_tail & (self.buffer_mask + 1);
+
+        unsafe {
+            let cur_val = &self.cache_buffer[cur_tail_mask];
+            if cur_val.load(Ordering::Acquire) != ptr::null_mut() {
+                let _ = Box::from_raw(ptr);
+                return
+            }
+            cur_val.store(ptr, Ordering::Relaxed);
+
+        }
+        self.buffer_tail.store(next_tail, Ordering::Release);
+    }
+
+    #[cfg(not(target = "x86_64"))]
     pub fn try_retrieve(&self) -> Option<*mut T> {
         let cur_head_guess = self.buffer_head.load(Ordering::Relaxed);
         let mut ctail = self.buffer_tail.load(Ordering::Acquire);
@@ -156,6 +179,36 @@ impl<T> CacheBufferSpMc<T> {
             };
         }
         None
+    }
+
+    // This is far better under x86, since multiple consumers can
+    // act at the same time. Maybe on arm...?
+    // Requires 64 bit since isn't safe on overflow
+    #[cfg(target = "x86_64")]
+     pub fn try_retrieve(&self) -> Option<*mut T> {
+        let cur_head_guess = self.buffer_head.load(Ordering::Relaxed);
+        let ctail = self.buffer_tail.load(Ordering::Acquire);
+
+        if cur_head_guess >= ctail {
+            return None
+        }
+
+        let cur_head_mask = cur_head_guess & self.buffer_mask;
+        let head_slot = self.buffer_head.fetch_add(1, Ordering::Relaxed);
+        let cur_ptr = &self.cache_buffer[cur_head_mask];
+
+        // This doesn't need to be acquire, since we have synchronized
+        // with the tail value
+        let cur_val = cur_ptr.load(Ordering::Relaxed);
+
+        if head_slot >= ctail || cur_val == ptr::null_mut() {
+            self.buffer_head.fetch_sub(1, Ordering::Relaxed);
+            return None
+        }
+
+        let rval = Some(cur_val);
+        cur_val.store(ptr::null_mut(), Ordering::Release);
+        rval
     }
 }
 
