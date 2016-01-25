@@ -102,6 +102,7 @@ impl<T> CacheBufferSpMc<T> {
         }
     }
 
+
     #[cfg(not(target = "x86_64"))]
     pub fn add_or_delete(&self, ptr: *mut T) {
         if ptr == ptr::null_mut() {
@@ -184,22 +185,20 @@ impl<T> CacheBufferSpMc<T> {
         let cur_head_guess = self.buffer_head.load(Ordering::Relaxed);
         let ctail = self.buffer_tail.load(Ordering::Acquire);
 
-        if cur_head_guess >= ctail {
-            return None
-        }
 
-        let cur_head_mask = cur_head_guess & self.buffer_mask;
+
         let head_slot = self.buffer_head.fetch_add(1, Ordering::Relaxed);
+        let cur_head_mask = head_slot & self.buffer_mask;
         let cur_ptr = &self.cache_buffer[cur_head_mask];
-
         // This doesn't need to be acquire, since we have synchronized
         // with the tail value
         let cur_val = cur_ptr.load(Ordering::Relaxed);
-
         if head_slot >= ctail || cur_val == ptr::null_mut() {
             self.buffer_head.fetch_sub(1, Ordering::Relaxed);
             return None
         }
+
+
 
         let rval = Some(cur_val);
         cur_val.store(ptr::null_mut(), Ordering::Release);
