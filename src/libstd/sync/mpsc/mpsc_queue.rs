@@ -112,16 +112,14 @@ impl<T> CacheBufferSpMc<T> {
         let cur_tail_mask = next_tail & (self.buffer_mask + 1);
         let cur_head = self.buffer_head.load(Ordering::Acquire);
 
-        unsafe {
-            if next_tail - cur_head > (self.buffer_mask + 1) {
+        if next_tail - cur_head > (self.buffer_mask + 1) {
+            unsafe {
                 let _ = Box::from_raw(ptr);
                 return
             }
-
-            let curnode = self.cache_buffer[cur_tail_mask].get();
-            *curnode = ptr;
-
         }
+
+        self.cache_buffer[cur_tail_mask].store(ptr, Ordering::Relaxed);
         self.buffer_tail.store(next_tail, Ordering::Release);
     }
 
@@ -134,15 +132,15 @@ impl<T> CacheBufferSpMc<T> {
         let next_tail = cur_tail.wrapping_add(1);
         let cur_tail_mask = next_tail & (self.buffer_mask + 1);
 
-        unsafe {
-            let cur_val = &self.cache_buffer[cur_tail_mask];
-            if cur_val.load(Ordering::Acquire) != ptr::null_mut() {
+        let cur_val = &self.cache_buffer[cur_tail_mask];
+        if cur_val.load(Ordering::Acquire) != ptr::null_mut() {
+            unsafe {
                 let _ = Box::from_raw(ptr);
                 return
             }
-            cur_val.store(ptr, Ordering::Relaxed);
-
         }
+        cur_val.store(ptr, Ordering::Relaxed);
+
         self.buffer_tail.store(next_tail, Ordering::Release);
     }
 
@@ -156,7 +154,7 @@ impl<T> CacheBufferSpMc<T> {
         }
 
         let mut cur_head = self.buffer_head.load(Ordering::Relaxed);
-        for _ in 0..1 {
+        for _ in 0..3 {
             let cur_head_mask = cur_head & self.buffer_mask;
             if cur_head >= ctail {
                 ctail = self.buffer_tail.load(Ordering::Acquire);
@@ -165,25 +163,22 @@ impl<T> CacheBufferSpMc<T> {
                 }
             }
 
-            unsafe {
-                let valptr = self.cache_buffer[cur_head_mask].get();
-                let rval = *valptr;
-                *valptr = ptr::null_mut();
-                let old_head = cur_head;
-                cur_head = self.buffer_head.compare_and_swap(cur_head,
-                   cur_head.wrapping_add(1),
-                   Ordering::Release);
-                if cur_head == old_head {
-                    return Some(rval)
-                }
-            };
+            let cur_ptr = &self.cache_buffer[cur_head_mask];
+            let rval = cur_ptr.load(Ordering::Relaxed);
+            let old_head = cur_head;
+            cur_head = self.buffer_head.compare_and_swap(cur_head,
+                                                         cur_head.wrapping_add(1),
+                                                         Ordering::Release);
+            if cur_head == old_head {
+                return Some(rval)
+            }
         }
         None
     }
 
     // This is far better under x86, since multiple consumers can
-    // act at the same time. Maybe on arm...?
-    // Requires 64 bit since isn't safe on overflow
+    // act at the same time. I don't know about arm, since there's
+    // ll/sc contention on the add.
     #[cfg(target = "x86_64")]
      pub fn try_retrieve(&self) -> Option<*mut T> {
         let cur_head_guess = self.buffer_head.load(Ordering::Relaxed);
