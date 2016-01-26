@@ -123,9 +123,6 @@ impl<T> CacheBufferSpMc<T> {
 
     #[cfg(target = "x86_64")]
     pub fn add_or_delete(&self, ptr: *mut T) {
-        if ptr == ptr::null_mut() {
-            return;
-        }
         let cur_tail = self.buffer_tail.load(Ordering::Relaxed);
         let next_tail = cur_tail.wrapping_add(1);
         let cur_tail_mask = cur_tail & self.buffer_mask;
