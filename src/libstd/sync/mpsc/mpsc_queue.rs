@@ -105,12 +105,9 @@ impl<T> CacheBufferSpMc<T> {
 
     //#[cfg(not(target = "x86_64"))]
     pub fn add_or_delete(&self, ptr: *mut T) {
-        if ptr == ptr::null_mut() {
-            return;
-        }
         let cur_tail = self.buffer_tail.load(Ordering::Relaxed);
         let next_tail = cur_tail.wrapping_add(1);
-        let cur_tail_mask = next_tail & self.buffer_mask;
+        let cur_tail_mask = curc_tail & self.buffer_mask;
         let cur_head = self.buffer_head.load(Ordering::Acquire);
 
         if next_tail - cur_head > (self.buffer_mask + 1) {
@@ -147,22 +144,15 @@ impl<T> CacheBufferSpMc<T> {
 
    // #[cfg(not(target = "x86_64"))]
     pub fn try_retrieve(&self) -> Option<*mut T> {
-        let cur_head_guess = self.buffer_head.load(Ordering::Relaxed);
+        let mut cur_head = self.buffer_head.load(Ordering::Acquire);
         let mut ctail = self.buffer_tail.load(Ordering::Acquire);
 
-        if cur_head_guess == ctail {
+        if cur_head == ctail {
             return None
         }
 
-        let mut cur_head = self.buffer_head.load(Ordering::Relaxed);
         for _ in 0..3 {
             let cur_head_mask = cur_head & self.buffer_mask;
-            if cur_head == ctail {
-                ctail = self.buffer_tail.load(Ordering::Acquire);
-                if cur_head == ctail {
-                    return None
-                }
-            }
 
             let cur_ptr = &self.cache_buffer[cur_head_mask];
             let rval = cur_ptr.load(Ordering::Relaxed);
@@ -172,6 +162,10 @@ impl<T> CacheBufferSpMc<T> {
                                                          Ordering::Release);
             if cur_head == old_head {
                 return Some(rval)
+            }
+            let mut ctail = self.buffer_tail.load(Ordering::Acquire);
+            if cur_head == ctail {
+                return None
             }
         }
         None
