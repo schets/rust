@@ -103,11 +103,11 @@ impl<T> CacheBufferSpMc<T> {
     }
 
 
-    //#[cfg(not(target = "x86_64"))]
+    #[cfg(not(target = "x86_64"))]
     pub fn add_or_delete(&self, ptr: *mut T) {
         let cur_tail = self.buffer_tail.load(Ordering::Relaxed);
         let next_tail = cur_tail.wrapping_add(1);
-        let cur_tail_mask = curc_tail & self.buffer_mask;
+        let cur_tail_mask = cur_tail & self.buffer_mask;
         let cur_head = self.buffer_head.load(Ordering::Acquire);
 
         if next_tail - cur_head > (self.buffer_mask + 1) {
@@ -121,14 +121,14 @@ impl<T> CacheBufferSpMc<T> {
         self.buffer_tail.store(next_tail, Ordering::Release);
     }
 
-    /*#[cfg(target = "x86_64")]
+    #[cfg(target = "x86_64")]
     pub fn add_or_delete(&self, ptr: *mut T) {
         if ptr == ptr::null_mut() {
             return;
         }
         let cur_tail = self.buffer_tail.load(Ordering::Relaxed);
         let next_tail = cur_tail.wrapping_add(1);
-        let cur_tail_mask = next_tail & self.buffer_mask;
+        let cur_tail_mask = cur_tail & self.buffer_mask;
 
         let cur_val = &self.cache_buffer[cur_tail_mask];
         if cur_val.load(Ordering::Acquire) != ptr::null_mut() {
@@ -140,9 +140,9 @@ impl<T> CacheBufferSpMc<T> {
         cur_val.store(ptr, Ordering::Relaxed);
 
         self.buffer_tail.store(next_tail, Ordering::Release);
-    }*/
+    }
 
-   // #[cfg(not(target = "x86_64"))]
+    #[cfg(not(target = "x86_64"))]
     pub fn try_retrieve(&self) -> Option<*mut T> {
         let mut cur_head = self.buffer_head.load(Ordering::Acquire);
         let mut ctail = self.buffer_tail.load(Ordering::Acquire);
@@ -171,13 +171,13 @@ impl<T> CacheBufferSpMc<T> {
         None
     }
 
-    /*
+
     // This is far better under x86, since multiple consumers can
     // act at the same time. I don't know about arm, since there's
     // ll/sc contention on the add.
     #[cfg(target = "x86_64")]
      pub fn try_retrieve(&self) -> Option<*mut T> {
-        let cur_head_guess = self.buffer_head.load(Ordering::Relaxed);
+        //let cur_head_guess = self.buffer_head.load(Ordering::A);
         let ctail = self.buffer_tail.load(Ordering::Acquire);
 
 
@@ -198,7 +198,7 @@ impl<T> CacheBufferSpMc<T> {
         let rval = Some(cur_val);
         cur_val.store(ptr::null_mut(), Ordering::Release);
         rval
-    } */
+    }
 }
 
 /// The multi-producer single-consumer structure. This is not cloneable, but it
