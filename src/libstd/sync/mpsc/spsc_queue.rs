@@ -1,336 +1,360 @@
-/* Copyright (c) 2010-2011 Dmitry Vyukov. All rights reserved.
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- *    1. Redistributions of source code must retain the above copyright notice,
- *       this list of conditions and the following disclaimer.
- *
- *    2. Redistributions in binary form must reproduce the above copyright
- *       notice, this list of conditions and the following disclaimer in the
- *       documentation and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY DMITRY VYUKOV "AS IS" AND ANY EXPRESS OR IMPLIED
- * WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT
- * SHALL DMITRY VYUKOV OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
- * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
- * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
- * PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
- * LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE
- * OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
- * ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *
- * The views and conclusions contained in the software and documentation are
- * those of the authors and should not be interpreted as representing official
- * policies, either expressed or implied, of Dmitry Vyukov.
- */
+//! A fast unbounded spsc_queue. Uses a linked list of arrays
 
-// http://www.1024cores.net/home/lock-free-algorithms/queues/unbounded-spsc-queue
-
-//! A single-producer single-consumer concurrent queue
-//!
-//! This module contains the implementation of an SPSC queue which can be used
-//! concurrently between two threads. This data structure is safe to use and
-//! enforces the semantics that there is one pusher and one popper.
-
-use alloc::boxed::Box;
+use sync::atomic::Ordering::{Acquire, Release, Relaxed, SeqCst};
+use sync::atomic::{AtomicUsize, AtomicPtr, fence};
 use core::ptr;
+use core::mem;
 use core::cell::UnsafeCell;
+use alloc::boxed::Box;
 
-use sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+const SEG_SIZE: usize = 64;
 
-// Node within the linked list queue of messages to send
-struct Node<T> {
-    // FIXME: this could be an uninitialized T if we're careful enough, and
-    //      that would reduce memory usage (and be a bit faster).
-    //      is it worth it?
-    value: Option<T>,           // nullable for re-use of nodes
-    next: AtomicPtr<Node<T>>,   // next node in the queue
+struct Segment<T> {
+    data: [UnsafeCell<T>; SEG_SIZE],
+    next: AtomicPtr<Segment<T>>,
 }
 
-/// The single-producer single-consumer queue. This structure is not cloneable,
-/// but it can be safely shared in an Arc if it is guaranteed that there
-/// is only one popper and one pusher touching the queue at any one point in
-/// time.
-pub struct Queue<T> {
-    // consumer fields
-    tail: UnsafeCell<*mut Node<T>>, // where to pop from
-    tail_prev: AtomicPtr<Node<T>>, // where to pop from
-
-    // producer fields
-    head: UnsafeCell<*mut Node<T>>,      // where to push to
-    first: UnsafeCell<*mut Node<T>>,     // where to get new nodes from
-    tail_copy: UnsafeCell<*mut Node<T>>, // between first/tail
-
-    // Cache maintenance fields. Additions and subtractions are stored
-    // separately in order to allow them to use nonatomic addition/subtraction.
-    cache_bound: usize,
-    cache_additions: AtomicUsize,
-    cache_subtractions: AtomicUsize,
-}
-
-unsafe impl<T: Send> Send for Queue<T> { }
-
-unsafe impl<T: Send> Sync for Queue<T> { }
-
-impl<T> Node<T> {
-    fn new() -> *mut Node<T> {
-        Box::into_raw(box Node {
-            value: None,
-            next: AtomicPtr::new(ptr::null_mut::<Node<T>>()),
-        })
+impl<T> Segment<T> {
+    pub fn new() -> Segment<T> {
+        Segment {
+            data: unsafe { mem::uninitialized() },
+            next: AtomicPtr::new(ptr::null_mut()),
+        }
     }
 }
+
+/// A single-producer, single consumer queue
+pub struct Queue<T> {
+    cache_stack: AtomicPtr<Segment<T>>,
+    cache_size: AtomicUsize,
+
+    // These dummies result in a tremendous performance improvement, ~300%+
+    _dummy_1: [u64; 8],
+    // data for the consumer
+    head: AtomicUsize,
+    head_block: AtomicPtr<Segment<T>>,
+    tail_cache: AtomicUsize,
+
+    _dummy_2: [u64; 8],
+    // data for the producer
+    tail: AtomicUsize,
+    tail_block: AtomicPtr<Segment<T>>,
+}
+
+unsafe impl<T: Send> Send for Queue<T> {}
+unsafe impl<T: Send> Sync for Queue<T> {}
 
 impl<T> Queue<T> {
-    /// Creates a new queue.
-    ///
-    /// This is unsafe as the type system doesn't enforce a single
-    /// consumer-producer relationship. It also allows the consumer to `pop`
-    /// items while there is a `peek` active due to all methods having a
-    /// non-mutable receiver.
-    ///
-    /// # Arguments
-    ///
-    ///   * `bound` - This queue implementation is implemented with a linked
-    ///               list, and this means that a push is always a malloc. In
-    ///               order to amortize this cost, an internal cache of nodes is
-    ///               maintained to prevent a malloc from always being
-    ///               necessary. This bound is the limit on the size of the
-    ///               cache (if desired). If the value is 0, then the cache has
-    ///               no bound. Otherwise, the cache will never grow larger than
-    ///               `bound` (although the queue itself could be much larger.
-    pub unsafe fn new(bound: usize) -> Queue<T> {
-        let n1 = Node::new();
-        let n2 = Node::new();
-        (*n1).next.store(n2, Ordering::Relaxed);
+    pub fn new() -> Queue<T> {
+        let first_block = Box::into_raw(Box::new(Segment::new()));
         Queue {
-            tail: UnsafeCell::new(n2),
-            tail_prev: AtomicPtr::new(n1),
-            head: UnsafeCell::new(n2),
-            first: UnsafeCell::new(n1),
-            tail_copy: UnsafeCell::new(n1),
-            cache_bound: bound,
-            cache_additions: AtomicUsize::new(0),
-            cache_subtractions: AtomicUsize::new(0),
+            cache_stack: AtomicPtr::new(ptr::null_mut()),
+            cache_size: AtomicUsize::new(0),
+
+            _dummy_1: unsafe { mem::uninitialized() },
+            head: AtomicUsize::new(1),
+            head_block: AtomicPtr::new(first_block),
+            tail_cache: AtomicUsize::new(1),
+
+            _dummy_2: unsafe { mem::uninitialized() },
+            tail: AtomicUsize::new(1),
+            tail_block: AtomicPtr::new(first_block),
         }
     }
 
-    /// Pushes a new value onto this queue. Note that to use this function
-    /// safely, it must be externally guaranteed that there is only one pusher.
-    pub fn push(&self, t: T) {
-        unsafe {
-            // Acquire a node (which either uses a cached one or allocates a new
-            // one), and then append this to the 'head' node.
-            let n = self.alloc();
-            assert!((*n).value.is_none());
-            (*n).value = Some(t);
-            (*n).next.store(ptr::null_mut(), Ordering::Relaxed);
-            (**self.head.get()).next.store(n, Ordering::Release);
-            *self.head.get() = n;
-        }
-    }
-
-    unsafe fn alloc(&self) -> *mut Node<T> {
-        // First try to see if we can consume the 'first' node for our uses.
-        // We try to avoid as many atomic instructions as possible here, so
-        // the addition to cache_subtractions is not atomic (plus we're the
-        // only one subtracting from the cache).
-        if *self.first.get() != *self.tail_copy.get() {
-            if self.cache_bound > 0 {
-                let b = self.cache_subtractions.load(Ordering::Relaxed);
-                self.cache_subtractions.store(b + 1, Ordering::Relaxed);
+    //#[inline(always)]
+    fn acquire_segment(&self) -> *mut Segment<T> {
+        let mut chead = self.cache_stack.load(Acquire);
+        loop {
+            if chead == ptr::null_mut() {
+                return Box::into_raw(Box::new(Segment::new()));
             }
-            let ret = *self.first.get();
-            *self.first.get() = (*ret).next.load(Ordering::Relaxed);
-            return ret;
-        }
-        // If the above fails, then update our copy of the tail and try
-        // again.
-        *self.tail_copy.get() = self.tail_prev.load(Ordering::Acquire);
-        if *self.first.get() != *self.tail_copy.get() {
-            if self.cache_bound > 0 {
-                let b = self.cache_subtractions.load(Ordering::Relaxed);
-                self.cache_subtractions.store(b + 1, Ordering::Relaxed);
+            let next = unsafe { (*chead).next.load(Relaxed) };
+            let cas = self.cache_stack.compare_and_swap(chead, next, Acquire);
+            if cas == chead {
+                self.cache_size.fetch_sub(1, Relaxed);
+                unsafe { (*chead).next.store(ptr::null_mut(), Relaxed); }
+                return chead
             }
-            let ret = *self.first.get();
-            *self.first.get() = (*ret).next.load(Ordering::Relaxed);
-            return ret;
-        }
-        // If all of that fails, then we have to allocate a new node
-        // (there's nothing in the node cache).
-        Node::new()
-    }
-
-    /// Attempts to pop a value from this queue. Remember that to use this type
-    /// safely you must ensure that there is only one popper at a time.
-    pub fn pop(&self) -> Option<T> {
-        unsafe {
-            // The `tail` node is not actually a used node, but rather a
-            // sentinel from where we should start popping from. Hence, look at
-            // tail's next field and see if we can use it. If we do a pop, then
-            // the current tail node is a candidate for going into the cache.
-            let tail = *self.tail.get();
-            let next = (*tail).next.load(Ordering::Acquire);
-            if next.is_null() { return None }
-            assert!((*next).value.is_some());
-            let ret = (*next).value.take();
-
-            *self.tail.get() = next;
-            if self.cache_bound == 0 {
-                self.tail_prev.store(tail, Ordering::Release);
-            } else {
-                // FIXME: this is dubious with overflow.
-                let additions = self.cache_additions.load(Ordering::Relaxed);
-                let subtractions = self.cache_subtractions.load(Ordering::Relaxed);
-                let size = additions - subtractions;
-
-                if size < self.cache_bound {
-                    self.tail_prev.store(tail, Ordering::Release);
-                    self.cache_additions.store(additions + 1, Ordering::Relaxed);
-                } else {
-                    (*self.tail_prev.load(Ordering::Relaxed))
-                          .next.store(next, Ordering::Relaxed);
-                    // We have successfully erased all references to 'tail', so
-                    // now we can safely drop it.
-                    let _: Box<Node<T>> = Box::from_raw(tail);
-                }
-            }
-            ret
+            chead = cas;
         }
     }
 
-    /// Attempts to peek at the head of the queue, returning `None` if the queue
-    /// has no data currently
+    //#[inline(always)]
+    fn release_segment(&self, seg: *mut Segment<T>) {
+        let mut chead = self.cache_stack.load(Acquire);
+        loop {
+            unsafe { (*seg).next.store(chead, Relaxed); }
+            if chead == ptr::null_mut() {
+                self.cache_stack.store(seg, Release);
+                return;
+            }
+            let cas = self.cache_stack.compare_and_swap(chead, seg, Release);
+            if cas == chead {
+                self.cache_size.fetch_add(1, Relaxed);
+                return;
+            }
+            chead = cas;
+        }
+    }
+
+    /// Tries constructing the element and inserts into the queue
     ///
-    /// # Warning
-    /// The reference returned is invalid if it is not used before the consumer
-    /// pops the value off the queue. If the producer then pushes another value
-    /// onto the queue, it will overwrite the value pointed to by the reference.
-    pub fn peek(&self) -> Option<&mut T> {
-        // This is essentially the same as above with all the popping bits
-        // stripped out.
+    /// Returns the closure if there isn't space
+    //#[inline(always)]
+    pub fn push(&self, val: T) {
+        let ctail = self.tail.load(Relaxed);
+        let next_tail = ctail.wrapping_add(1);
+        //SEG_SIZE is a power of 2, so this is cheap
+        let write_ind = ctail % SEG_SIZE;
+        let mut tail_block = self.tail_block.load(Relaxed);
+        if write_ind == 0 {
+            let next = self.acquire_segment();
+            unsafe { (*tail_block).next.store(next, Relaxed); }
+            tail_block = next;
+            self.tail_block.store(next, Relaxed);
+        }
         unsafe {
-            let tail = *self.tail.get();
-            let next = (*tail).next.load(Ordering::Acquire);
-            if next.is_null() { None } else { (*next).value.as_mut() }
+            let data_pos = (*tail_block).data[write_ind].get();
+            ptr::write(data_pos, val);
+        }
+        self.tail.store(next_tail, Release);
+    }
+
+    pub fn pop(&self) -> Option<T> {
+        let chead = self.head.load(Relaxed);
+        if chead == self.tail_cache.load(Relaxed) {
+            let cur_tail = self.tail.load(Acquire);
+            self.tail_cache.store(cur_tail, Relaxed);
+            if chead == cur_tail {
+                return None;
+            }
+        }
+
+        let next_head = chead + 1;
+        let read_ind = chead % SEG_SIZE;
+        let mut head_block = self.head_block.load(Relaxed);
+        if read_ind == 0 {
+            // Acquire is not needed because this can only happen
+            // once the head/tail have moved appropriately (and synchronized)
+            let next = unsafe{ (*head_block).next.load(Relaxed) };
+            if next == ptr::null_mut() {
+                return None;
+            }
+            self.release_segment(head_block);
+            head_block = next;
+            self.head_block.store(next, Relaxed);
+        }
+        unsafe {
+            let data_pos = (*head_block).data[read_ind].get();
+            let rval = Some(ptr::read(data_pos));
+            // Nothing synchronizes with the head! so the store can be relaxed
+            // A benefit of this is that the common case
+            self.head.store(next_head, Relaxed);
+            rval
+        }
+    }
+
+    pub fn peek(&self) -> Option<&mut T> {
+        let chead = self.head.load(Relaxed);
+        if chead == self.tail_cache.load(Relaxed) {
+            let cur_tail = self.tail.load(Acquire);
+            self.tail_cache.store(cur_tail, Relaxed);
+            if chead == cur_tail {
+                return None;
+            }
+        }
+
+        let read_ind = chead % SEG_SIZE;
+        let head_block = self.head_block.load(Relaxed);
+        if read_ind == 0 {
+            // Acquire is not needed because this can only happen
+            // once the head/tail have moved appropriately (and synchronized)
+            let next = unsafe{ (*head_block).next.load(Relaxed) };
+            if next == ptr::null_mut() {
+                return None;
+            }
+            return unsafe { Some(&mut *(*next).data[read_ind].get()) }
+        }
+        unsafe {
+            let data_pos = (*head_block).data[read_ind].get();
+            Some(&mut *data_pos)
         }
     }
 }
+
 
 impl<T> Drop for Queue<T> {
     fn drop(&mut self) {
-        unsafe {
-            let mut cur = *self.first.get();
-            while !cur.is_null() {
-                let next = (*cur).next.load(Ordering::Relaxed);
-                let _n: Box<Node<T>> = Box::from_raw(cur);
-                cur = next;
+        fence(SeqCst);
+        loop {
+            if let None = self.pop() {
+                break;
             }
         }
+        let mut cache_head = self.cache_stack.load(Relaxed);
+        while cache_head != ptr::null_mut() {
+            unsafe {
+                let next = (*cache_head).next.load(Relaxed);
+                Box::from_raw(cache_head);
+                cache_head = next;
+            }
+        }
+
     }
 }
 
+/*
+#[allow(unused_must_use)]
 #[cfg(test)]
-mod tests {
-    use prelude::v1::*;
+mod test {
 
-    use sync::Arc;
-    use super::Queue;
-    use thread;
-    use sync::mpsc::channel;
+    use scope;
+    use super::*;
+    use std::sync::atomic::Ordering::{Relaxed};
+    use std::sync::atomic::AtomicUsize;
+    const CONC_COUNT: i64 = 1000000;
 
     #[test]
-    fn smoke() {
-        unsafe {
-            let queue = Queue::new(0);
-            queue.push(1);
-            queue.push(2);
-            assert_eq!(queue.pop(), Some(1));
-            assert_eq!(queue.pop(), Some(2));
-            assert_eq!(queue.pop(), None);
-            queue.push(3);
-            queue.push(4);
-            assert_eq!(queue.pop(), Some(3));
-            assert_eq!(queue.pop(), Some(4));
-            assert_eq!(queue.pop(), None);
+    fn push_pop_1_b() {
+        let (prod, cons) = Queue::<i64>::new(1);
+        assert_eq!(prod.try_push(37), Ok(()));
+        assert_eq!(cons.try_pop(), Some(37));
+        assert_eq!(cons.try_pop(), None)
+    }
+
+
+    #[test]
+    fn push_pop_2_b() {
+        let (prod, cons) = Queue::<i64>::new(1);
+        assert_eq!(prod.try_push(37).is_ok(), true);
+        assert_eq!(prod.try_construct(|| 48).is_ok(), true);
+        assert_eq!(cons.try_pop(), Some(37));
+        assert_eq!(cons.try_pop(), Some(48));
+        assert_eq!(cons.try_pop(), None)
+    }
+
+    #[test]
+    fn push_pop_many_seq() {
+        let (prod, cons) = Queue::<i64>::new(5);
+        for i in 0..200 {
+            assert_eq!(prod.try_push(i).is_ok(), true);
+        }
+        for i in 0..200 {
+            assert_eq!(cons.try_pop(), Some(i));
         }
     }
 
     #[test]
-    fn peek() {
-        unsafe {
-            let queue = Queue::new(0);
-            queue.push(vec![1]);
+    fn push_bounded() {
+        //this is strange but a side effect of starting...
+        let msize = 63;
+        let (prod, cons) = Queue::<i64>::new(1);
+        for _ in 0..msize {
+            assert_eq!(prod.try_push(1).is_ok(), true);
+        }
+        assert_eq!(prod.try_push(2), Err(2));
+        assert_eq!(cons.try_pop(), Some(1));
+        assert_eq!(prod.try_push(2).is_ok(), true);
+        for _ in 0..(msize-1) {
+            assert_eq!(cons.try_pop(), Some(1));
+        }
+        assert_eq!(cons.try_pop(), Some(2));
 
-            // Ensure the borrowchecker works
-            match queue.peek() {
-                Some(vec) => match &**vec {
-                    // Note that `pop` is not allowed here due to borrow
-                    [1] => {}
-                    _ => return
-                },
-                None => unreachable!()
-            }
+    }
 
-            queue.pop();
+    struct Dropper<'a> {
+        aref: &'a AtomicUsize,
+    }
+
+    impl<'a> Drop for Dropper<'a> {
+        fn drop(& mut self) {
+            self.aref.fetch_add(1, Relaxed);
         }
     }
 
     #[test]
-    fn drop_full() {
-        unsafe {
-            let q: Queue<Box<_>> = Queue::new(0);
-            q.push(box 1);
-            q.push(box 2);
+    fn drop_on_dtor() {
+        let msize = 100;
+        let drop_count = AtomicUsize::new(0);
+        {
+            let (prod, _) = Queue::new(msize);
+            for _ in 0..msize {
+                prod.try_push(Dropper{aref: &drop_count});
+            };
         }
+        assert_eq!(drop_count.load(Relaxed), msize);
     }
 
     #[test]
-    fn smoke_bound() {
-        unsafe {
-            let q = Queue::new(0);
-            q.push(1);
-            q.push(2);
-            assert_eq!(q.pop(), Some(1));
-            assert_eq!(q.pop(), Some(2));
-            assert_eq!(q.pop(), None);
-            q.push(3);
-            q.push(4);
-            assert_eq!(q.pop(), Some(3));
-            assert_eq!(q.pop(), Some(4));
-            assert_eq!(q.pop(), None);
-        }
-    }
+    fn push_pop_many_spsc() {
+        return;
+        let qsize = 100;
+        let (prod, cons) = Queue::<i64>::new(100);
 
-    #[test]
-    fn stress() {
-        unsafe {
-            stress_bound(0);
-            stress_bound(1);
-        }
+        scope(|scope| {
+            scope.spawn(move || {
+                let mut next = 0;
 
-        unsafe fn stress_bound(bound: usize) {
-            let q = Arc::new(Queue::new(bound));
-
-            let (tx, rx) = channel();
-            let q2 = q.clone();
-            let _t = thread::spawn(move|| {
-                for _ in 0..100000 {
-                    loop {
-                        match q2.pop() {
-                            Some(1) => break,
-                            Some(_) => panic!(),
-                            None => {}
-                        }
+                while next < CONC_COUNT {
+                    if let Some(elem) = cons.try_pop() {
+                        assert_eq!(elem, next);
+                        next += 1;
                     }
                 }
-                tx.send(()).unwrap();
             });
-            for _ in 0..100000 {
-                q.push(1);
+
+            let mut i = 0;
+            while i < CONC_COUNT {
+                match prod.try_push(i) {
+                    Err(_) => continue,
+                    Ok(_) => {i += 1;},
+                }
             }
-            rx.recv().unwrap();
-        }
+        });
     }
-}
+/*
+    #[test]
+    fn test_capacity() {
+        let qsize = 100;
+        let (prod, cons) = Queue::<i64>::new(qsize);
+        assert_eq!(prod.capacity(), qsize);
+        assert_eq!(cons.capacity(), qsize);
+        for _ in 0..(qsize/2) {
+            prod.try_push(1);
+        }
+        assert_eq!(prod.capacity(), qsize);
+        assert_eq!(cons.capacity(), qsize);
+    }*/
+/*
+    #[test]
+    fn test_life_queries() {
+        let (prod, cons) = Queue::<i64>::new();
+        assert_eq!(prod.is_consumer_alive(), true);
+        assert_eq!(cons.is_producer_alive(), true);
+        assert_eq!(prod.try_push(1), Ok(()));
+        {
+            let _x = cons;
+            assert_eq!(prod.is_consumer_alive(), true);
+            assert_eq!(prod.create_consumer().is_none(), true);
+        }
+        assert_eq!(prod.is_consumer_alive(), false);
+        assert_eq!(prod.try_push(1), Err(1));
+        let new_cons_o = prod.create_consumer();
+        assert_eq!(prod.is_consumer_alive(), true);
+        assert_eq!(new_cons_o.is_some(), true);
+        assert_eq!(prod.create_consumer().is_none(), true);
+        let new_cons = new_cons_o.unwrap();
+
+        {
+            let _x = prod;
+            assert_eq!(new_cons.is_producer_alive(), true);
+            assert_eq!(new_cons.create_producer().is_none(), true);
+        }
+        assert_eq!(new_cons.is_producer_alive(), false);
+        assert_eq!(new_cons.try_pop(), Some(1));
+        let new_prod = new_cons.create_producer();
+        assert_eq!(new_prod.is_some(), true);
+        assert_eq!(new_cons.create_producer().is_none(), true);
+    }*/
+}*/
