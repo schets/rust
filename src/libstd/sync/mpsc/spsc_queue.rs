@@ -1,7 +1,7 @@
 //! A fast unbounded spsc_queue. Uses a linked list of arrays
 
-use sync::atomic::Ordering::{Acquire, Release, Relaxed, SeqCst};
-use sync::atomic::{AtomicUsize, AtomicPtr, fence};
+use sync::atomic::Ordering::{Acquire, Release, Relaxed};
+use sync::atomic::{AtomicUsize, AtomicPtr};
 use core::ptr;
 use core::mem;
 use core::cell::UnsafeCell;
@@ -186,7 +186,6 @@ impl<T> Queue<T> {
 
 impl<T> Drop for Queue<T> {
     fn drop(&mut self) {
-        fence(SeqCst);
         loop {
             if let None = self.pop() {
                 break;
@@ -200,7 +199,10 @@ impl<T> Drop for Queue<T> {
                 cache_head = next;
             }
         }
-
+        let head_block = self.head_block.load(Relaxed);
+        let tail_block = self.tail_block.load(Relaxed);
+        unsafe { Box::from_raw(head_block); }
+        if tail_block != head_block { unsafe { Box::from_raw(tail_block); } }
     }
 }
 
