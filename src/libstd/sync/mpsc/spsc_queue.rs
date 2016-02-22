@@ -25,8 +25,8 @@ impl<T> Segment<T> {
 
 /// A single-producer, single consumer queue
 pub struct Queue<T> {
-   // cache_stack: AtomicPtr<Segment<T>>,
-   // cache_size: AtomicUsize,
+    cache_stack: AtomicPtr<Segment<T>>,
+    cache_size: AtomicUsize,
 
     // These dummies result in a tremendous performance improvement, ~300%+
     _dummy_1: [u64; 8],
@@ -48,8 +48,8 @@ impl<T> Queue<T> {
     pub fn new() -> Queue<T> {
         let first_block = Box::into_raw(Box::new(Segment::new()));
         Queue {
-       //     cache_stack: AtomicPtr::new(ptr::null_mut()),
-           // cache_size: AtomicUsize::new(0),
+            cache_stack: AtomicPtr::new(ptr::null_mut()),
+            cache_size: AtomicUsize::new(0),
 
             _dummy_1: unsafe { mem::uninitialized() },
             head: AtomicUsize::new(1),
@@ -63,7 +63,6 @@ impl<T> Queue<T> {
     }
 
     fn acquire_segment(&self) -> *mut Segment<T> {
-        return Box::into_raw(Box::new(Segment::new()))/*
         let mut chead = self.cache_stack.load(Acquire);
         loop {
             if chead == ptr::null_mut() {
@@ -77,14 +76,12 @@ impl<T> Queue<T> {
                 return chead
             }
             chead = cas;
-        }*/
+        }
     }
 
     //#[inline(always)]
     fn release_segment(&self, seg: *mut Segment<T>) {
-         unsafe { Box::from_raw(seg); }
-         return;
-        /*// Does this need to be acquire? Consume is definitely safe here...
+        // Does this need to be acquire? Consume is definitely safe here...
         let mut chead = self.cache_stack.load(Relaxed);
         loop {
             if self.cache_size.load(Relaxed) > 3 {
@@ -98,12 +95,9 @@ impl<T> Queue<T> {
                 break;
             }
             chead = cas;
-        }*/
+        }
     }
 
-    /// Tries constructing the element and inserts into the queue
-    ///
-    /// Returns the closure if there isn't space
     //#[inline(always)]
     pub fn push(&self, val: T) {
         let ctail = self.tail.load(Relaxed);
@@ -194,8 +188,8 @@ impl<T> Drop for Queue<T> {
                 break;
             }
         }
-        let head_block = self.tail_block.load(Relaxed);
-        unsafe { Box::from_raw(head_block); }
+        //let head_block = self.tail_block.load(Relaxed);
+        //unsafe { Box::from_raw(head_block); }
 
 
        /* let mut cache_head = self.cache_stack.load(Relaxed);
