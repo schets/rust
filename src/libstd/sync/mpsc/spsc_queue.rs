@@ -25,8 +25,8 @@ impl<T> Segment<T> {
 
 /// A single-producer, single consumer queue
 pub struct Queue<T> {
-    cache_stack: AtomicPtr<Segment<T>>,
-    cache_size: AtomicUsize,
+   // cache_stack: AtomicPtr<Segment<T>>,
+   // cache_size: AtomicUsize,
 
     // These dummies result in a tremendous performance improvement, ~300%+
     _dummy_1: [u64; 8],
@@ -48,8 +48,8 @@ impl<T> Queue<T> {
     pub fn new() -> Queue<T> {
         let first_block = Box::into_raw(Box::new(Segment::new()));
         Queue {
-            cache_stack: AtomicPtr::new(ptr::null_mut()),
-            cache_size: AtomicUsize::new(0),
+       //     cache_stack: AtomicPtr::new(ptr::null_mut()),
+           // cache_size: AtomicUsize::new(0),
 
             _dummy_1: unsafe { mem::uninitialized() },
             head: AtomicUsize::new(1),
@@ -62,8 +62,8 @@ impl<T> Queue<T> {
         }
     }
 
-    //#[inline(always)]
     fn acquire_segment(&self) -> *mut Segment<T> {
+        return Box::into_raw(Box::new(Segment::new()))/*
         let mut chead = self.cache_stack.load(Acquire);
         loop {
             if chead == ptr::null_mut() {
@@ -77,25 +77,28 @@ impl<T> Queue<T> {
                 return chead
             }
             chead = cas;
-        }
+        }*/
     }
 
     //#[inline(always)]
     fn release_segment(&self, seg: *mut Segment<T>) {
-        let mut chead = self.cache_stack.load(Acquire);
+         unsafe { Box::from_raw(seg); }
+         return;
+        /*// Does this need to be acquire? Consume is definitely safe here...
+        let mut chead = self.cache_stack.load(Relaxed);
         loop {
-            unsafe { (*seg).next.store(chead, Relaxed); }
-            if chead == ptr::null_mut() {
-                self.cache_stack.store(seg, Release);
-                return;
+            if self.cache_size.load(Relaxed) > 3 {
+                unsafe { Box::from_raw(seg); }
+                return
             }
+            unsafe { (*seg).next.store(chead, Relaxed); }
             let cas = self.cache_stack.compare_and_swap(chead, seg, Release);
             if cas == chead {
                 self.cache_size.fetch_add(1, Relaxed);
-                return;
+                break;
             }
             chead = cas;
-        }
+        }*/
     }
 
     /// Tries constructing the element and inserts into the queue
@@ -109,6 +112,7 @@ impl<T> Queue<T> {
         let write_ind = ctail % SEG_SIZE;
         let mut tail_block = self.tail_block.load(Relaxed);
         if write_ind == 0 {
+            // try to get another segment
             let next = self.acquire_segment();
             unsafe { (*tail_block).next.store(next, Relaxed); }
             tail_block = next;
@@ -131,7 +135,7 @@ impl<T> Queue<T> {
             }
         }
 
-        let next_head = chead + 1;
+        let next_head = chead.wrapping_add(1);
         let read_ind = chead % SEG_SIZE;
         let mut head_block = self.head_block.load(Relaxed);
         if read_ind == 0 {
@@ -149,7 +153,6 @@ impl<T> Queue<T> {
             let data_pos = (*head_block).data[read_ind].get();
             let rval = Some(ptr::read(data_pos));
             // Nothing synchronizes with the head! so the store can be relaxed
-            // A benefit of this is that the common case
             self.head.store(next_head, Relaxed);
             rval
         }
@@ -191,18 +194,18 @@ impl<T> Drop for Queue<T> {
                 break;
             }
         }
-        let mut cache_head = self.cache_stack.load(Relaxed);
+        let head_block = self.tail_block.load(Relaxed);
+        unsafe { Box::from_raw(head_block); }
+
+
+       /* let mut cache_head = self.cache_stack.load(Relaxed);
         while cache_head != ptr::null_mut() {
             unsafe {
                 let next = (*cache_head).next.load(Relaxed);
                 Box::from_raw(cache_head);
                 cache_head = next;
             }
-        }
-        let head_block = self.head_block.load(Relaxed);
-        let tail_block = self.tail_block.load(Relaxed);
-        unsafe { Box::from_raw(head_block); }
-        if tail_block != head_block { unsafe { Box::from_raw(tail_block); } }
+        }*/
     }
 }
 
