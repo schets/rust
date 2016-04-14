@@ -16,7 +16,7 @@ use core::cell::{UnsafeCell, Cell};
 
 use sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
-const SEGMENT_SIZE: usize = 64;
+const SEG_SIZE: usize = 64;
 
 /// Based on the Crossbeam SegQueue
 
@@ -46,6 +46,85 @@ struct Segment<T> {
 
     // Next is at top for similar reasons to high
     next: AtomicPtr<Segment<T>>,
+}
+
+impl<T> Segment<T> {
+    fn new() -> Segment<T> {
+        let rqueue = Segment {
+            data: unsafe { mem::uninitialized() },
+            low: AtomicUsize::new(0),
+            high: AtomicUsize::new(0),
+            next: Atomic::null(),
+        };
+        for val in rqueue.data.iter() {
+            unsafe {
+                (*val.get()).1 = AtomicBool::new(false);
+            }
+        }
+        rqueue
+    }
+}
+
+impl<T> SegQueue<T> {
+    /// Create a new, empty queue.
+    pub fn new() -> SegQueue<T> {
+        let q = SegQueue {
+            head: Atomic::null(),
+            tail: Atomic::null(),
+        };
+        let sentinel = Owned::new(Segment::new());
+        let guard = epoch::pin();
+        let sentinel = q.head.store_and_ref(sentinel, Relaxed, &guard);
+        q.tail.store_shared(Some(sentinel), Relaxed);
+        q
+    }
+
+    /// Add `t` to the back of the queue.
+    pub fn push(&self, t: T) {
+        loop {
+            let tail = self.tail.load(Acquire, &guard).unwrap();
+            if tail.high.load(Relaxed) >= SEG_SIZE { continue }
+            let i = tail.high.fetch_add(1, Relaxed);
+            unsafe {
+                if i < SEG_SIZE {
+                    let cell = (*tail).data.get_unchecked(i).get();
+                    ptr::write(&mut (*cell).0, t);
+                    (*cell).1.store(true, Release);
+
+                    if i + 1 == SEG_SIZE {
+                        let tail = tail.next.store_and_ref(Owned::new(Segment::new()), Release);
+                        self.tail.store_shared(Some(tail), Release);
+                    }
+
+                    return
+                }
+            }
+        }
+    }
+
+    /// Attempt to dequeue from the front.
+    ///
+    /// Returns `None` if the queue is observed to be empty.
+    pub fn pop(&self) -> PopResult<T> {
+        let mut head = unsafe { &*self.head.load(Acquire) };
+        let low = head.low.get();
+        if low + 1 == SEG_SIZE {
+            match head.next.load(Acquire, &guard) {
+                Some(next) => self.head.store_shared(Some(next), Release),
+                None => return Empty
+            }
+        }
+        if low >= cmp::min(head.high.load(Relaxed), SEG_SIZE) { return Empty }
+        unsafe {
+            let cell = (*head).data.get_unchecked(low).get();
+            if !(*cell).1.load(Acquire) {
+                return Inconsistent
+            }
+
+            head.low.set(low + 1);
+            return Data(ptr::read(&(*cell).0))
+        }
+    }
 }
 
 struct Node<T> {
