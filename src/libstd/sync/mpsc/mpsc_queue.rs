@@ -16,7 +16,7 @@ use core::cell::{UnsafeCell, Cell};
 
 use sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
-const SEG_SIZE: usize = 64;
+const NODE_SIZE: usize = 64;
 
 /// Based on the Crossbeam SegQueue
 
@@ -33,24 +33,30 @@ pub enum PopResult<T> {
     Inconsistent,
 }
 
+// This should do some C-like tricks to store
+// a variable sized array inline so the segment size can be adjusted to
+// the size of T - i.e. for example, store 4k bytes per node and
+// switch to old queue when sizeof(T) is > 1k
+
 #[repr(C)]
-struct Segment<T> {
+struct Node<T> {
 
     // Low stored at bottom of data to be 'distant' from producers
     low: Cell<usize>,
-    data: [UnsafeCell<(T, bool)>; SEGMENT_SIZE],
+
+    data: [UnsafeCell<(T, bool)>; Node_SIZE],
 
     // High stored near top since it will not be modified
     // by time consumer is near top
     high: AtomicUsize,
 
     // Next is at top for similar reasons to high
-    next: AtomicPtr<Segment<T>>,
+    next: AtomicPtr<Node<T>>,
 }
 
-impl<T> Segment<T> {
-    fn new() -> Segment<T> {
-        let rqueue = Segment {
+impl<T> Node<T> {
+    fn new() -> Node<T> {
+        let rqueue = Node {
             data: unsafe { mem::uninitialized() },
             low: AtomicUsize::new(0),
             high: AtomicUsize::new(0),
@@ -65,14 +71,24 @@ impl<T> Segment<T> {
     }
 }
 
-impl<T> SegQueue<T> {
+/// The multi-producer single-consumer structure. This is not cloneable, but it
+/// may be safely shared so long as it is guaranteed that there is only one
+/// popper at a time (many pushers are allowed).
+pub struct Queue<T> {
+    head: AtomicPtr<Node<T>>,
+    tail: UnsafeCell<*mut Node<T>>,
+}
+
+unsafe impl<T: Send> Send for Queue<T> { }
+unsafe impl<T: Send> Sync for Queue<T> { }
+impl<T> Queue<T> {
     /// Create a new, empty queue.
-    pub fn new() -> SegQueue<T> {
-        let q = SegQueue {
+    pub fn new() -> Queue<T> {
+        let q = Queue {
             head: Atomic::null(),
             tail: Atomic::null(),
         };
-        let sentinel = Owned::new(Segment::new());
+        let sentinel = Owned::new(Node::new());
         let guard = epoch::pin();
         let sentinel = q.head.store_and_ref(sentinel, Relaxed, &guard);
         q.tail.store_shared(Some(sentinel), Relaxed);
@@ -92,7 +108,7 @@ impl<T> SegQueue<T> {
                     (*cell).1.store(true, Release);
 
                     if i + 1 == SEG_SIZE {
-                        let tail = tail.next.store_and_ref(Owned::new(Segment::new()), Release);
+                        let tail = tail.next.store_and_ref(Owned::new(Node::new()), Release);
                         self.tail.store_shared(Some(tail), Release);
                     }
 
@@ -106,10 +122,10 @@ impl<T> SegQueue<T> {
     ///
     /// Returns `None` if the queue is observed to be empty.
     pub fn pop(&self) -> PopResult<T> {
-        let mut head = unsafe { &*self.head.load(Acquire) };
+        let head = unsafe { &*self.head.get() };
         let low = head.low.get();
         if low + 1 == SEG_SIZE {
-            match head.next.load(Acquire, &guard) {
+            match head.next.load(Acquire) {
                 Some(next) => self.head.store_shared(Some(next), Release),
                 None => return Empty
             }
@@ -127,92 +143,7 @@ impl<T> SegQueue<T> {
     }
 }
 
-struct Node<T> {
-    next: AtomicPtr<Node<T>>,
-    value: Option<T>,
-}
 
-/// The multi-producer single-consumer structure. This is not cloneable, but it
-/// may be safely shared so long as it is guaranteed that there is only one
-/// popper at a time (many pushers are allowed).
-pub struct Queue<T> {
-    head: AtomicPtr<Node<T>>,
-    tail: UnsafeCell<*mut Node<T>>,
-}
-
-unsafe impl<T: Send> Send for Queue<T> { }
-unsafe impl<T: Send> Sync for Queue<T> { }
-
-impl<T> Node<T> {
-    unsafe fn new(v: Option<T>) -> *mut Node<T> {
-        Box::into_raw(box Node {
-            next: AtomicPtr::new(ptr::null_mut()),
-            value: v,
-        })
-    }
-}
-
-impl<T> Queue<T> {
-    /// Creates a new queue that is safe to share among multiple producers and
-    /// one consumer.
-    pub fn new() -> Queue<T> {
-        let stub = unsafe { Node::new(None) };
-        Queue {
-            head: AtomicPtr::new(stub),
-            tail: UnsafeCell::new(stub),
-        }
-    }
-
-    /// Pushes a new value onto this queue.
-    pub fn push(&self, t: T) {
-        unsafe {
-            let n = Node::new(Some(t));
-            let prev = self.head.swap(n, Ordering::AcqRel);
-            (*prev).next.store(n, Ordering::Release);
-        }
-    }
-
-    /// Pops some data from this queue.
-    ///
-    /// Note that the current implementation means that this function cannot
-    /// return `Option<T>`. It is possible for this queue to be in an
-    /// inconsistent state where many pushes have succeeded and completely
-    /// finished, but pops cannot return `Some(t)`. This inconsistent state
-    /// happens when a pusher is pre-empted at an inopportune moment.
-    ///
-    /// This inconsistent state means that this queue does indeed have data, but
-    /// it does not currently have access to it at this time.
-    pub fn pop(&self) -> PopResult<T> {
-        unsafe {
-            let tail = *self.tail.get();
-            let next = (*tail).next.load(Ordering::Acquire);
-
-            if !next.is_null() {
-                *self.tail.get() = next;
-                assert!((*tail).value.is_none());
-                assert!((*next).value.is_some());
-                let ret = (*next).value.take().unwrap();
-                let _: Box<Node<T>> = Box::from_raw(tail);
-                return Data(ret);
-            }
-
-            if self.head.load(Ordering::Acquire) == tail {Empty} else {Inconsistent}
-        }
-    }
-}
-
-impl<T> Drop for Queue<T> {
-    fn drop(&mut self) {
-        unsafe {
-            let mut cur = *self.tail.get();
-            while !cur.is_null() {
-                let next = (*cur).next.load(Ordering::Relaxed);
-                let _: Box<Node<T>> = Box::from_raw(cur);
-                cur = next;
-            }
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
