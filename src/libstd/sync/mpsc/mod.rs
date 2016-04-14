@@ -285,6 +285,7 @@ mod shared;
 mod stream;
 mod sync;
 mod mpsc_queue;
+mod seg_mpsc_queue;
 mod spsc_queue;
 
 /// The receiving-half of Rust's channel type. This half can only be owned by

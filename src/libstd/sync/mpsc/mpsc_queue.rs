@@ -76,7 +76,7 @@ impl<T> Node<T> {
 /// popper at a time (many pushers are allowed).
 pub struct Queue<T> {
     head: AtomicPtr<Node<T>>,
-    tail: UnsafeCell<*mut Node<T>>,
+    tail: Cell<*mut Node<T>>,
 }
 
 unsafe impl<T: Send> Send for Queue<T> { }
@@ -85,31 +85,35 @@ impl<T> Queue<T> {
     /// Create a new, empty queue.
     pub fn new() -> Queue<T> {
         let q = Queue {
-            head: Atomic::null(),
             tail: Atomic::null(),
+            head: Atomic::null(),
         };
         let sentinel = Owned::new(Node::new());
         let guard = epoch::pin();
-        let sentinel = q.head.store_and_ref(sentinel, Relaxed, &guard);
-        q.tail.store_shared(Some(sentinel), Relaxed);
+        let sentinel = q.tail.store_and_ref(sentinel, Relaxed, &guard);
+        q.head.store_shared(Some(sentinel), Relaxed);
         q
     }
 
     /// Add `t` to the back of the queue.
     pub fn push(&self, t: T) {
         loop {
-            let tail = self.tail.load(Acquire, &guard).unwrap();
-            if tail.high.load(Relaxed) >= SEG_SIZE { continue }
-            let i = tail.high.fetch_add(1, Relaxed);
+            let head = unsafe { &*self.head.load(Acquire) };
+            if head.high.load(Relaxed) >= SEG_SIZE { continue }
+            let i = head.high.fetch_add(1, Relaxed);
             unsafe {
                 if i < SEG_SIZE {
-                    let cell = (*tail).data.get_unchecked(i).get();
+                    let cell = head.data.get_unchecked(i).get();
+
+                    // of note -  this part is worse for large objects
+                    // since the write of T happens after acquiring a queue
+                    // spot, while the previous one
                     ptr::write(&mut (*cell).0, t);
                     (*cell).1.store(true, Release);
 
                     if i + 1 == SEG_SIZE {
-                        let tail = tail.next.store_and_ref(Owned::new(Node::new()), Release);
-                        self.tail.store_shared(Some(tail), Release);
+                        let head = head.next.store_and_ref(Owned::new(Node::new()), Release);
+                        self.head.store_shared(Some(head), Release);
                     }
 
                     return
@@ -122,22 +126,22 @@ impl<T> Queue<T> {
     ///
     /// Returns `None` if the queue is observed to be empty.
     pub fn pop(&self) -> PopResult<T> {
-        let head = unsafe { &*self.head.get() };
-        let low = head.low.get();
+        let tail = unsafe { &*self.tail.get() };
+        let low = tail.low.get();
         if low + 1 == SEG_SIZE {
-            match head.next.load(Acquire) {
-                Some(next) => self.head.store_shared(Some(next), Release),
+            match tail.next.load(Acquire) {
+                Some(next) => self.tail.store_shared(Some(next), Release),
                 None => return Empty
             }
         }
-        if low >= cmp::min(head.high.load(Relaxed), SEG_SIZE) { return Empty }
+        if low >= cmp::min(tail.high.load(Relaxed), SEG_SIZE) { return Empty }
         unsafe {
-            let cell = (*head).data.get_unchecked(low).get();
+            let cell = (*tail).data.get_unchecked(low).get();
             if !(*cell).1.load(Acquire) {
                 return Inconsistent
             }
 
-            head.low.set(low + 1);
+            tail.low.set(low + 1);
             return Data(ptr::read(&(*cell).0))
         }
     }
