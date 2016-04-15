@@ -1,24 +1,50 @@
-// Copyright 2013-2014 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
+/* Copyright (c) 2010-2011 Dmitry Vyukov. All rights reserved.
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ *    1. Redistributions of source code must retain the above copyright notice,
+ *       this list of conditions and the following disclaimer.
+ *
+ *    2. Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY DMITRY VYUKOV "AS IS" AND ANY EXPRESS OR IMPLIED
+ * WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT
+ * SHALL DMITRY VYUKOV OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+ * PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+ * LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE
+ * OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
+ * ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ *
+ * The views and conclusions contained in the software and documentation are
+ * those of the authors and should not be interpreted as representing official
+ * policies, either expressed or implied, of Dmitry Vyukov.
+ */
+
+//! A mostly lock-free multi-producer, single consumer queue.
+//!
+//! This module contains an implementation of a concurrent MPSC queue. This
+//! queue can be used to share data between threads, and is also used as the
+//! building block of channels in rust.
+//!
+//! Note that the current implementation of this queue has a caveat of the `pop`
+//! method, and see the method for more information about it. Due to this
+//! caveat, this queue may not be appropriate for all use-cases.
+
+// http://www.1024cores.net/home/lock-free-algorithms
+//                         /queues/non-intrusive-mpsc-node-based-queue
 
 pub use self::PopResult::*;
 
 use alloc::boxed::Box;
 use core::ptr;
-use core::cell::{UnsafeCell, Cell};
+use core::cell::UnsafeCell;
 
-use sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
-
-const NODE_SIZE: usize = 64;
-
-/// Based on the Crossbeam SegQueue
+use sync::atomic::{AtomicPtr, Ordering};
 
 /// A result of the `pop` function.
 pub enum PopResult<T> {
@@ -33,42 +59,9 @@ pub enum PopResult<T> {
     Inconsistent,
 }
 
-// This should do some C-like tricks to store
-// a variable sized array inline so the segment size can be adjusted to
-// the size of T - i.e. for example, store 4k bytes per node and
-// switch to old queue when sizeof(T) is > 1k
-
-#[repr(C)]
 struct Node<T> {
-
-    // Low stored at bottom of data to be 'distant' from producers
-    low: Cell<usize>,
-
-    data: [UnsafeCell<(T, bool)>; Node_SIZE],
-
-    // High stored near top since it will not be modified
-    // by time consumer is near top
-    high: AtomicUsize,
-
-    // Next is at top for similar reasons to high
     next: AtomicPtr<Node<T>>,
-}
-
-impl<T> Node<T> {
-    fn new() -> Node<T> {
-        let rqueue = Node {
-            data: unsafe { mem::uninitialized() },
-            low: AtomicUsize::new(0),
-            high: AtomicUsize::new(0),
-            next: Atomic::null(),
-        };
-        for val in rqueue.data.iter() {
-            unsafe {
-                (*val.get()).1 = AtomicBool::new(false);
-            }
-        }
-        rqueue
-    }
+    value: Option<T>,
 }
 
 /// The multi-producer single-consumer structure. This is not cloneable, but it
@@ -76,78 +69,82 @@ impl<T> Node<T> {
 /// popper at a time (many pushers are allowed).
 pub struct Queue<T> {
     head: AtomicPtr<Node<T>>,
-    tail: Cell<*mut Node<T>>,
+    tail: UnsafeCell<*mut Node<T>>,
 }
 
 unsafe impl<T: Send> Send for Queue<T> { }
 unsafe impl<T: Send> Sync for Queue<T> { }
+
+impl<T> Node<T> {
+    unsafe fn new(v: Option<T>) -> *mut Node<T> {
+        Box::into_raw(box Node {
+            next: AtomicPtr::new(ptr::null_mut()),
+            value: v,
+        })
+    }
+}
+
 impl<T> Queue<T> {
-    /// Create a new, empty queue.
+    /// Creates a new queue that is safe to share among multiple producers and
+    /// one consumer.
     pub fn new() -> Queue<T> {
-        let q = Queue {
-            tail: Atomic::null(),
-            head: Atomic::null(),
-        };
-        let sentinel = Owned::new(Node::new());
-        let guard = epoch::pin();
-        let sentinel = q.tail.store_and_ref(sentinel, Relaxed, &guard);
-        q.head.store_shared(Some(sentinel), Relaxed);
-        q
+        let stub = unsafe { Node::new(None) };
+        Queue {
+            head: AtomicPtr::new(stub),
+            tail: UnsafeCell::new(stub),
+        }
     }
 
-    /// Add `t` to the back of the queue.
+    /// Pushes a new value onto this queue.
     pub fn push(&self, t: T) {
-        loop {
-            let head = unsafe { &*self.head.load(Acquire) };
-            if head.high.load(Relaxed) >= SEG_SIZE { continue }
-            let i = head.high.fetch_add(1, Relaxed);
-            unsafe {
-                if i < SEG_SIZE {
-                    let cell = head.data.get_unchecked(i).get();
-
-                    // of note -  this part is worse for large objects
-                    // since the write of T happens after acquiring a queue
-                    // spot, while the previous one
-                    ptr::write(&mut (*cell).0, t);
-                    (*cell).1.store(true, Release);
-
-                    if i + 1 == SEG_SIZE {
-                        let head = head.next.store_and_ref(Owned::new(Node::new()), Release);
-                        self.head.store_shared(Some(head), Release);
-                    }
-
-                    return
-                }
-            }
+        unsafe {
+            let n = Node::new(Some(t));
+            let prev = self.head.swap(n, Ordering::AcqRel);
+            (*prev).next.store(n, Ordering::Release);
         }
     }
 
-    /// Attempt to dequeue from the front.
+    /// Pops some data from this queue.
     ///
-    /// Returns `None` if the queue is observed to be empty.
+    /// Note that the current implementation means that this function cannot
+    /// return `Option<T>`. It is possible for this queue to be in an
+    /// inconsistent state where many pushes have succeeded and completely
+    /// finished, but pops cannot return `Some(t)`. This inconsistent state
+    /// happens when a pusher is pre-empted at an inopportune moment.
+    ///
+    /// This inconsistent state means that this queue does indeed have data, but
+    /// it does not currently have access to it at this time.
     pub fn pop(&self) -> PopResult<T> {
-        let tail = unsafe { &*self.tail.get() };
-        let low = tail.low.get();
-        if low + 1 == SEG_SIZE {
-            match tail.next.load(Acquire) {
-                Some(next) => self.tail.store_shared(Some(next), Release),
-                None => return Empty
-            }
-        }
-        if low >= cmp::min(tail.high.load(Relaxed), SEG_SIZE) { return Empty }
         unsafe {
-            let cell = (*tail).data.get_unchecked(low).get();
-            if !(*cell).1.load(Acquire) {
-                return Inconsistent
+            let tail = *self.tail.get();
+            let next = (*tail).next.load(Ordering::Acquire);
+
+            if !next.is_null() {
+                *self.tail.get() = next;
+                assert!((*tail).value.is_none());
+                assert!((*next).value.is_some());
+                let ret = (*next).value.take().unwrap();
+                let _: Box<Node<T>> = Box::from_raw(tail);
+                return Data(ret);
             }
 
-            tail.low.set(low + 1);
-            return Data(ptr::read(&(*cell).0))
+            if self.head.load(Ordering::Acquire) == tail {Empty} else {Inconsistent}
         }
     }
 }
 
-
+impl<T> Drop for Queue<T> {
+    fn drop(&mut self) {
+        unsafe {
+            let mut cur = *self.tail.get();
+            while !cur.is_null() {
+                let next = (*cur).next.load(Ordering::Relaxed);
+                let _: Box<Node<T>> = Box::from_raw(cur);
+                cur = next;
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
