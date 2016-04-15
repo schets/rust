@@ -85,7 +85,7 @@ impl<T> Queue<T> {
             head: AtomicPtr::new(ptr::null_mut()),
         };
         let sentinel = Box::new(Node::new()).into_raw();
-        q.tail.set(sentinel)
+        q.tail.set(sentinel);
         q.head.store(sentinel, Relaxed);
         q
     }
@@ -108,7 +108,8 @@ impl<T> Queue<T> {
                     (*cell).1.store(true, Release);
 
                     if i + 1 == NODE_SIZE {
-                        let head = head.next.store_and_ref(Owned::new(Node::new()), Release);
+                        let new_seg = Box::new(Node::new()).into_raw();
+                        let head = head.next.store(new_seg, Release);
                         self.head.store_shared(Some(head), Release);
                     }
 
