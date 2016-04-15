@@ -13,9 +13,9 @@ pub use self::PopResult::*;
 use core::ptr;
 use cor::cmp;
 use core::cell::{UnsafeCell, Cell};
-
-use sync::atomic::{AtomicPtr, AtomicUsize};
-use sync::atomic::Odering::{Acquire, Release, Relaxed};
+use alloc::boxed::Box;
+use sync::atomic::{AtomicPtr, AtomicUsize, AtomicBool};
+use sync::atomic::Ordering::{Acquire, Release, Relaxed};
 
 const NODE_SIZE: usize = 64;
 
@@ -34,18 +34,13 @@ pub enum PopResult<T> {
     Inconsistent,
 }
 
-// This should do some C-like tricks to store
-// a variable sized array inline so the segment size can be adjusted to
-// the size of T - i.e. for example, store 4k bytes per node and
-// switch to old queue when sizeof(T) is > 1k
-
 #[repr(C)]
 struct Node<T> {
 
     // Low stored at bottom of data to be 'distant' from producers
     low: Cell<usize>,
 
-    data: [UnsafeCell<(T, bool)>; NODE_SIZE],
+    data: [UnsafeCell<(T, AtomicBool)>; NODE_SIZE],
 
     // High stored near top since it will not be modified
     // by time consumer is near top
@@ -86,12 +81,12 @@ impl<T> Queue<T> {
     /// Create a new, empty queue.
     pub fn new() -> Queue<T> {
         let q = Queue {
-            tail: Atomic::null(),
-            head: Atomic::null(),
+            tail: Cell::new(ptr::null_mut()),
+            head: AtomicPtr::new(ptr::null_mut()),
         };
-        let sentinel = Box::new(Node::new());
-        let sentinel = q.tail.store_and_ref(sentinel, Relaxed);
-        q.head.store_shared(Some(sentinel), Relaxed);
+        let sentinel = Box::new(Node::new()).into_raw();
+        q.tail.set(sentinel)
+        q.head.store(sentinel, Relaxed);
         q
     }
 
@@ -130,16 +125,23 @@ impl<T> Queue<T> {
         let tail = unsafe { &*self.tail.get() };
         let low = tail.low.get();
         if low + 1 == NODE_SIZE {
-            match tail.next.load(Acquire) {
-                Some(next) => self.tail.store_shared(Some(next), Release),
-                None => return Empty
-            }
+            let next = tail.next.load(Acquire);
+            if next == ptr::null_mut() { return Empty }
+            self.tail.set(next)
         }
         if low >= cmp::min(tail.high.load(Relaxed), NODE_SIZE) { return Empty }
         unsafe {
             let cell = (*tail).data.get_unchecked(low).get();
-            if !(*cell).1.load(Acquire) {
-                return Inconsistent
+            // Spin for a tiny bit before returning inconsistent
+            for _ in 0..5 {
+                if !(*cell).1.load(Acquire) {
+                    if (i == 4) {
+                        return Inconsistent
+                    }
+                }
+                else {
+                    break;
+                }
             }
 
             tail.low.set(low + 1);
