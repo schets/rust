@@ -284,7 +284,7 @@ mod select;
 mod shared;
 mod stream;
 mod sync;
-mod mpsc_queue;
+//mod mpsc_queue;
 mod seg_mpsc_queue;
 mod spsc_queue;
 

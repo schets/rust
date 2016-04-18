@@ -25,7 +25,7 @@ use core::isize;
 
 use sync::atomic::{AtomicUsize, AtomicIsize, AtomicBool, Ordering};
 use sync::mpsc::blocking::{self, SignalToken};
-use sync::mpsc::mpsc_queue as mpsc;
+use sync::mpsc::seg_mpsc_queue as mpsc;
 use sync::mpsc::select::StartResult::*;
 use sync::mpsc::select::StartResult;
 use sync::{Mutex, MutexGuard};

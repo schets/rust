@@ -11,7 +11,7 @@
 pub use self::PopResult::*;
 
 use core::ptr;
-use cor::cmp;
+use core::mem;
 use core::cell::{UnsafeCell, Cell};
 use alloc::boxed::Box;
 use sync::atomic::{AtomicPtr, AtomicUsize, AtomicBool};
@@ -40,6 +40,9 @@ struct Node<T> {
     // Low stored at bottom of data to be 'distant' from producers
     low: Cell<usize>,
 
+    // Cached value of the high thing to avoid cache misses
+    high_cache: Cell<usize>,
+
     data: [UnsafeCell<(T, AtomicBool)>; NODE_SIZE],
 
     // High stored near top since it will not be modified
@@ -54,9 +57,10 @@ impl<T> Node<T> {
     fn new() -> Node<T> {
         let rqueue = Node {
             data: unsafe { mem::uninitialized() },
-            low: AtomicUsize::new(0),
+            low: Cell::new(0),
+            high_cache: Cell::new(0),
             high: AtomicUsize::new(0),
-            next: AtomicPtr::null(),
+            next: AtomicPtr::new(ptr::null_mut()),
         };
         for val in rqueue.data.iter() {
             unsafe {
@@ -84,7 +88,7 @@ impl<T> Queue<T> {
             tail: Cell::new(ptr::null_mut()),
             head: AtomicPtr::new(ptr::null_mut()),
         };
-        let sentinel = Box::new(Node::new()).into_raw();
+        let sentinel = Box::into_raw(Box::new(Node::new()));
         q.tail.set(sentinel);
         q.head.store(sentinel, Relaxed);
         q
@@ -108,9 +112,9 @@ impl<T> Queue<T> {
                     (*cell).1.store(true, Release);
 
                     if i + 1 == NODE_SIZE {
-                        let new_seg = Box::new(Node::new()).into_raw();
-                        let head = head.next.store(new_seg, Release);
-                        self.head.store_shared(Some(head), Release);
+                        let new_seg = Box::into_raw(Box::new(Node::new()));
+                        head.next.store(new_seg, Release);
+                        self.head.store(new_seg, Release);
                     }
 
                     return
@@ -123,20 +127,31 @@ impl<T> Queue<T> {
     ///
     /// Returns `None` if the queue is observed to be empty.
     pub fn pop(&self) -> PopResult<T> {
-        let tail = unsafe { &*self.tail.get() };
-        let low = tail.low.get();
-        if low + 1 == NODE_SIZE {
-            let next = tail.next.load(Acquire);
-            if next == ptr::null_mut() { return Empty }
-            self.tail.set(next)
-        }
-        if low >= cmp::min(tail.high.load(Relaxed), NODE_SIZE) { return Empty }
         unsafe {
-            let cell = (*tail).data.get_unchecked(low).get();
+            let mut tailp = self.tail.get();
+            let mut low = (*tailp).low.get();
+            if low >= NODE_SIZE {
+                let next = (*tailp).next.load(Acquire);
+                if next == ptr::null_mut() { return Inconsistent }
+                Box::from_raw(tailp);
+                self.tail.set(next);
+                tailp = next;
+                low = 0;
+            }
+            let tail = &*tailp;
+
+            // suboptimal when switching nodes...
+            let high_cache = tail.high_cache.get();
+            if low >= high_cache {
+                let high_val = tail.high.load(Acquire);
+                tail.high_cache.set(high_val);
+                if low >= high_val { return Empty }
+            }
+            let cell = tail.data.get_unchecked(low).get();
             // Spin for a tiny bit before returning inconsistent
-            for _ in 0..5 {
+            for i in 0..5 {
                 if !(*cell).1.load(Acquire) {
-                    if (i == 4) {
+                    if i == 4 {
                         return Inconsistent
                     }
                 }
@@ -152,11 +167,9 @@ impl<T> Queue<T> {
 }
 
 
-
 #[cfg(test)]
 mod tests {
     use prelude::v1::*;
-    use alloc::boxed::Box;
 
     use sync::mpsc::channel;
     use super::{Queue, Data, Empty, Inconsistent};
